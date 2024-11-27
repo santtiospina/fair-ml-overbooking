@@ -1,2 +1,10 @@
 __pycache__/
 .DS_Store
+
+# ignore files inside these directories
+simulation_outputs/automation_plots/*
+simulation_outputs/excel_files/*
+
+# keep directories themselves
+!simulation_outputs/automation_plots/
+!simulation_outputs/excel_files/
