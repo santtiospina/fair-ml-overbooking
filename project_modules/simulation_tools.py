@@ -47,7 +47,7 @@ class Sampling:
             # sample_protected_true.append(random_patient)
 
             # region muestrear pacientes con alta probabilidad
-            if i%100_000 == 0:
+            if i%3 == 0:
                 high_proba_protected_patient = high_proba_protected[np.random.choice(len(high_proba_protected))]
                 sample_protected_true.append(high_proba_protected_patient)
             else:
@@ -141,7 +141,6 @@ class Appointments:
                 patient.attendance = random.random() <= npv
         
         return patients_data
-
 stablish_attendance = Appointments.stablish_attendance
 create_appointments = Appointments.create_appointments
 

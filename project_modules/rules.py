@@ -1,7 +1,7 @@
 from project_modules.project_imports import *
 from project_modules.classes import Patient, Clinic
 
-def call_a_rule (patient_list, appointments, name_rule, ml_model, threshold_protected, threshold_no_protected, overbooking):
+def call_a_rule (patient_list, appointments, name_rule, ml_model, threshold_protected, threshold_no_protected, overbooking_level):
     
     refused_patients=0
     num_protected=0
@@ -12,19 +12,23 @@ def call_a_rule (patient_list, appointments, name_rule, ml_model, threshold_prot
         if name_rule=='fcfa':
             appointments = fcfa(patient, appointments)
         elif name_rule=='overbooking_simple':
-            appointments = rule_overbooking(patient, appointments, threshold_protected, threshold_no_protected, overbooking, ml_model )
+            appointments = rule_overbooking(patient, appointments, threshold_protected, threshold_no_protected, overbooking_level, ml_model )
         
         # elif name_rule=='overbooking_high_proba':
-        #     appointments = rule_overbooking_high(patient,patient_list, appointments, threshold_protected, threshold_no_protected, overbooking, ml_model )
+        #     appointments = rule_overbooking_high(patient,patient_list, appointments, threshold_protected, threshold_no_protected, overbooking_level, ml_model )
         # elif name_rule=='low_probability':
         #     appointments = low_probability(patient, appointments, threshold_protected, threshold_no_protected, patient_list, ml_model)
         
-        elif name_rule=='fountain_overbooking':
-            appointments = fountain_overbooking(patient,patient_list, appointments, threshold_protected,threshold_no_protected,overbooking, ml_model)
+        elif name_rule=='fountain':
+            appointments = fountain_overbooking(patient, patient_list, 
+                                                appointments, 
+                                                threshold_protected, threshold_no_protected,
+                                                overbooking_level,
+                                                ml_model)
         elif name_rule=='ATBEG':
             appointments = ATBEG(patient, appointments, 
                                  threshold_protected, threshold_no_protected, 
-                                 overbooking, 
+                                 overbooking_level, 
                                  ml_model)
         else:
             print("Unknown name_rule")
@@ -48,7 +52,7 @@ def fcfa(patient, appointments):
                             return appointments
     return appointments
 
-def rule_overbooking(patient, appointments, threshold_protected,threshold_no_protected,nivel_overbooking ,train_model):
+def rule_overbooking(patient, appointments, threshold_protected, threshold_no_protected, nivel_overbooking, train_model):
 
     # Establece si un paciente si le puede hacer overbooking segun su probabilidad (ALTA)
 
@@ -107,24 +111,26 @@ def rule_overbooking(patient, appointments, threshold_protected,threshold_no_pro
     return appointments
 
 # K primeros overbooking y overbooking a los de alta probabilidad
-def fountain_overbooking(patient, patient_list, appointments, threshold_protected,threshold_no_protected, nivel_overbooking, train_model):
+def fountain_overbooking(patient, patient_list, 
+                         appointments, 
+                         threshold_protected, threshold_no_protected, 
+                         nivel_overbooking,
+                         train_model):
     
     patient.overbooked = False
-    overbook=False
+    overbook = False
 
     # Predice proba de inasistencia con el respectivo modelo
     # patient.predict_proba(train_model)
     
     # Decide si overbook o no basado en la prediccion
     if patient.protected==True:
-        overbook=True if patient.proba>threshold_protected else False
+        overbook=True if patient.proba > threshold_protected else False
     else:
-        overbook=True if patient.proba>threshold_no_protected else False
+        overbook=True if patient.proba > threshold_no_protected else False
 
     if overbook:
         patient.overbooked = True
-    
-    initial_over = 5
     
     # Si el paciente aun no se ha asignado 
     if not patient.assigned:
@@ -137,7 +143,7 @@ def fountain_overbooking(patient, patient_list, appointments, threshold_protecte
         # Itera desde el dia que llama hasta el final
         for dia in range(start_day, end_day):
             # Asignaciones fijas de overbooking
-            for i in range(0, initial_over):
+            for i in range(0, nivel_overbooking):
                 if appointments[0][dia][i][0] is None:
                     appointments[0][dia][i][0] = patient.id
                     patient.num_slot=i
