@@ -47,7 +47,7 @@ class Sampling:
             # sample_protected_true.append(random_patient)
 
             # region muestrear pacientes con alta probabilidad
-            if i%3 == 0:
+            if i%10 == 0:
                 high_proba_protected_patient = high_proba_protected[np.random.choice(len(high_proba_protected))]
                 sample_protected_true.append(high_proba_protected_patient)
             else:

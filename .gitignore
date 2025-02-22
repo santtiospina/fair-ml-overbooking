@@ -8,3 +8,4 @@ simulation_outputs/excel_files/*
 # keep directories themselves
 !simulation_outputs/automation_plots/
 !simulation_outputs/excel_files/
+*.xlsx
