@@ -1,0 +1,27 @@
+[project]
+name = "Quantifying_and_Mitigating_Bias"
+version = "0.1.0"
+description = "A project to quantify and mitigate bias in machine learning models."
+requires-python = ">=3.10"
+dependencies = [
+    "scikit-learn==1.4.0",
+    "pandas>=2.1.4",
+    "matplotlib",
+    "seaborn",
+    "pingouin",
+    "openpyxl",
+    "lightgbm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipykernel>=6.30.0",
+    "ruff>=0.13.0",
+    "pytest>=8.3.0",
+    "pytest-cov>=6.0.0",
+    "pre-commit>=4.1.0",
+]
+
+[tool.uv]
+managed = true
+package = false

@@ -1,3 +1,4 @@
+# project_modules/simulation_tools.py
 from project_modules.project_imports import *
 from project_modules.classes import Patient, Clinic
 
@@ -13,8 +14,6 @@ class Sampling:
             # asignar dia de llamada a cada paciente
             for i, patient in enumerate(patient_list_sample):
                 patient.day_of_call = i//patients_per_day
-                # patient.id=i
-                #patient.properties()
 
             # organizar por dia de llamada
             patient_list_sample.sort(key=lambda x:x.day_of_call)
@@ -24,8 +23,8 @@ class Sampling:
         protected_true = [patient for patient in patients if patient.protected]
         protected_false = [patient for patient in patients if not patient.protected]
 
-        high_proba_protected = [patient for patient in protected_true if patient.proba > 0.5]
-        high_proba_non_protected = [patient for patient in protected_false if patient.proba > 0.5]
+        high_proba_protected = [patient for patient in protected_true if patient.proba > 0.3]
+        high_proba_non_protected = [patient for patient in protected_false if patient.proba > 0.3]
 
         assert type(high_proba_protected[0]) == Patient, "High proba protected patients in list must be Patient object"
         assert type(high_proba_non_protected[0]) == Patient, "High proba non protected patients in list must be Patient object"
@@ -38,36 +37,24 @@ class Sampling:
         assert type(sample_size_protected_true) == int, "Protected sample size must be an integer"
         assert type(sample_size_protected_false) == int, "Non Protected sample size must be an integer"
 
-        sample_protected_true = []
-        sample_protected_false = []
+        # Inside random_patient_sample
+        n_high_protected = max(1, sample_size_protected_true // 10)
+        n_random_protected = sample_size_protected_true - n_high_protected
 
-        # Random selection with high probabilities in sample
-        for i in range(sample_size_protected_true):
-            # random_patient = protected_true[np.random.choice(len(protected_true))]
-            # sample_protected_true.append(random_patient)
+        # Pick high-proba first
+        high_indices = np.random.choice(len(high_proba_protected), n_high_protected, replace=False)
+        high_selected = [high_proba_protected[i] for i in high_indices]
+        high_selected_ids = {id(p) for p in high_selected}
 
-            # region muestrear pacientes con alta probabilidad
-            if i%10 == 0:
-                high_proba_protected_patient = high_proba_protected[np.random.choice(len(high_proba_protected))]
-                sample_protected_true.append(high_proba_protected_patient)
-            else:
-                random_patient = protected_true[np.random.choice(len(protected_true))]
-                sample_protected_true.append(random_patient)
-            # endregion
+        # Random pool excludes already-selected patients
+        remaining_protected = [p for p in protected_true if id(p) not in high_selected_ids]
+        random_indices = np.random.choice(len(remaining_protected), n_random_protected, replace=False)
 
-        for i in range(sample_size_protected_false):
-                # random_patient = protected_false[np.random.choice(len(protected_false))]
-                # sample_protected_false.append(random_patient)
-                
-                # region Comentario para seleccionar pacientes con alta probabilidad
-                if i%100_000 == 0:
-                    sample_protected_false.append(high_proba_non_protected[np.random.choice(len(high_proba_non_protected))])
-                else:
-                    sample_protected_false.append(protected_false[np.random.choice(len(protected_false))])
-                # endregion
-                
-        # sample_protected_true = [protected_true[i] for i in np.random.choice(len(protected_true), sample_size_protected_true, replace=False)]
-        # sample_protected_false = [protected_false[i] for i in np.random.choice(len(protected_false), sample_size_protected_false, replace=False)]
+        sample_protected_true = high_selected + [remaining_protected[i] for i in random_indices]
+
+        # Non-protected sample: pure random, no replacement
+        non_protected_indices = np.random.choice(len(protected_false), sample_size_protected_false, replace=False)
+        sample_protected_false = [protected_false[i] for i in non_protected_indices]
 
         # Final stratified sample
         stratified_sample = sample_protected_true + sample_protected_false
@@ -177,21 +164,26 @@ class Processing:
         return results
 
     def check_convergence_mean(data, converge_mean=0.07, verbose=False):
-        results = {}
         results = Processing.get_margin_errors(data)
         
-        medidas_converge=['COlumna1','Columna2']
+        converge = False
+        diff = None
 
         for key in results:
             margin_error = results[key]['margin_of_error']
             mean = results[key]['mean']
-            diff = margin_error/mean
+
+            if mean == 0:
+                converge = True
+                continue
+            
+            diff = margin_error / mean
             
             if verbose:
-                    print(f"Margin difference with the mean {diff:.4f}")
+                print(f"Margin difference with the mean {diff:.4f}")
             
             if diff <= converge_mean:
-                converge=True
+                converge = True
             else:
                 return False, diff
         

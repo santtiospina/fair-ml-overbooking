@@ -1,0 +1,26 @@
+// .devcontainer/devcontainer.json
+{
+  "name": "Fairness Matters: Quantifying and Mitigating Bias in Machine-Learning-Based Overbooking Policies for Outpatient Scheduling",
+  "image": "jrpenagu/python:3.10",
+  "runArgs": [
+    "--name", "${localWorkspaceFolderBasename}"
+  ],
+  "overrideCommand": true,
+  "shutdownAction": "stopContainer",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-toolsai.jupyter",
+        "mutantdino.resourcemonitor",
+        "github.copilot",
+        "github.copilot-chat"
+      ]
+    }
+  },
+  "postCreateCommand": "sudo uv pip install --system --extra=dev -r pyproject.toml"
+}
