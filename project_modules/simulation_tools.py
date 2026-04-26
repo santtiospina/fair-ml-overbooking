@@ -8,16 +8,20 @@ class Sampling:
         protected_pct = protected_pct
 
         def asignar_dia(patient_list_sample, num_days):
-            # determinar cuantos pacientes por dia
-            patients_per_day = len(patient_list_sample) // num_days
-        
-            # asignar dia de llamada a cada paciente
-            for i, patient in enumerate(patient_list_sample):
-                patient.day_of_call = i//patients_per_day
+            n = len(patient_list_sample)
 
-            # organizar por dia de llamada
-            patient_list_sample.sort(key=lambda x:x.day_of_call)
+            base = n // num_days
+            extra = n % num_days
 
+            idx = 0
+            for day in range(num_days):
+                count = base + (1 if day < extra else 0)
+
+                for _ in range(count):
+                    patient_list_sample[idx].day_of_call = day
+                    idx += 1
+
+            patient_list_sample.sort(key=lambda x: x.day_of_call)
             return patient_list_sample
         
         protected_true = [patient for patient in patients if patient.protected]
@@ -109,7 +113,7 @@ class Appointments:
             appointments.append(server)
         return appointments
     
-    def stablish_attendance(patients_data, 
+    def establish_attendance(patients_data, 
                         protected_ppv, non_protected_ppv, 
                         protected_npv, non_protected_npv,
                         protected_threshold, non_protected_threshold,
@@ -128,7 +132,7 @@ class Appointments:
                 patient.attendance = random.random() <= npv
         
         return patients_data
-stablish_attendance = Appointments.stablish_attendance
+establish_attendance = Appointments.establish_attendance
 create_appointments = Appointments.create_appointments
 
 class Processing:
@@ -163,31 +167,62 @@ class Processing:
 
         return results
 
-    def check_convergence_mean(data, converge_mean=0.07, verbose=False):
-        results = Processing.get_margin_errors(data)
-        
-        converge = False
-        diff = None
+    def check_convergence_mean(data, converge_mean=0.02, key_metrics=None, verbose=False):
+        """
+        Checks whether the Monte Carlo estimate has converged.
 
-        for key in results:
+        Two changes from the previous version:
+        1. Tighter default threshold (0.02 instead of 0.07). Effect sizes in
+            fairness experiments here are ~2-10%; the margin-of-error / mean
+            ratio must be smaller than the effect size to be able to detect it.
+        2. Restricted by default to the key metrics that drive the hypothesis.
+            Checking every metric (including idle_time_server, no_shows, etc.)
+            lets noisy, high-variance metrics block convergence indefinitely
+            and/or trigger premature stops on ill-behaved metrics.
+
+        Returns (converged: bool, worst_diff: float).
+        """
+        results = Processing.get_margin_errors(data)
+
+        if key_metrics is None:
+            key_metrics = [
+                "conflict_rate_protected",
+                "conflict_rate_non_protected",
+                "protected_overbooked_waiting_time",
+                "non_protected_overbooked_waiting_time",
+                "conflict_slots_protected",
+                "conflict_slots_non_protected",
+            ]
+
+        worst_diff = None
+        worst_key  = None
+        for key in key_metrics:
+            if key not in results:
+                continue
             margin_error = results[key]['margin_of_error']
             mean = results[key]['mean']
 
-            if mean == 0:
-                converge = True
+            if mean == 0 or np.isnan(mean):
                 continue
-            
-            diff = margin_error / mean
-            
+
+            diff = margin_error / abs(mean)
+
             if verbose:
-                print(f"Margin difference with the mean {diff:.4f}")
-            
-            if diff <= converge_mean:
-                converge = True
-            else:
-                return False, diff
-        
-        return converge, diff
+                print(f"  [convergence] {key:40s} margin/mean = {diff:.4f}")
+
+            if worst_diff is None or diff > worst_diff:
+                worst_diff = diff
+                worst_key  = key
+
+        if worst_diff is None:
+            # No key metric had non-zero mean — treat as converged
+            return True, 0.0
+
+        converged = worst_diff <= converge_mean
+        if verbose:
+            print(f"  [convergence] worst: {worst_key} @ {worst_diff:.4f} "
+                f"(target {converge_mean}) -> {'OK' if converged else 'NOT YET'}")
+        return converged, worst_diff
 
     def confidence_interval(data, confidence=0.95):
         """ This function calculates the confidence interval for a given set of data.

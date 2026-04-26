@@ -2,29 +2,38 @@
 from project_modules.project_imports import *
 from project_modules.classes import Patient, Clinic
 
-def call_a_rule (patient_list, appointments, name_rule, ml_model, threshold_protected, threshold_no_protected, overbooking_level):
-    
-    refused_patients=0
-    num_protected=0
-    num_no_protected=0
-    
-    # Determinar procedimiento a usar segun rule name
+def call_a_rule(
+    patient_list,
+    appointments,
+    name_rule,
+    ml_model,
+    threshold_protected,
+    threshold_no_protected,
+    overbooking_level
+):
+    refused_patients = 0
     for patient in patient_list:
-        if name_rule=='fcfa':
+        if name_rule == 'fcfa':
             appointments = fcfa(patient, appointments)
-        elif name_rule=='overbooking_simple':
-            appointments = rule_overbooking(patient, appointments, threshold_protected, threshold_no_protected, overbooking_level, ml_model )
-        
-        elif name_rule=='fountain':
-            appointments = fountain_overbooking(patient, patient_list, 
-                                                appointments, 
-                                                threshold_protected, threshold_no_protected,
-                                                overbooking_level,
-                                                ml_model)
+        elif name_rule == 'overbooking_simple':
+            appointments = rule_overbooking(
+                patient, appointments,
+                threshold_protected, threshold_no_protected,
+                overbooking_level, ml_model)
+        elif name_rule == 'fountain':
+            appointments = fountain_overbooking(
+                patient, patient_list, appointments,
+                threshold_protected, threshold_no_protected,
+                overbooking_level, ml_model)
+        elif name_rule == 'simple_pairing':
+            appointments = rule_simple_pairing(
+                patient, patient_list, appointments,
+                threshold_protected, threshold_no_protected,
+                overbooking_level)
         else:
             print("Unknown name_rule")
+
         if not patient.assigned:
-                        #print(f"Patient {patient.id} could not be assigned within the next {simulation_days} days")
             refused_patients += 1
     return appointments, refused_patients
 
@@ -63,7 +72,7 @@ def rule_overbooking(patient, appointments, threshold_protected, threshold_no_pr
 
         for dia in range(start_day, end_day):
 
-            # ── Branch A: Try real overbooking (stack onto an existing booking) ──
+            # -- Branch A: Try real overbooking (stack onto an existing booking) --
             # Only eligible patients attempt this. patient.overbooked becomes True
             # ONLY if the stack actually happens.
             if overbook_eligible and not patient.assigned:
@@ -78,7 +87,7 @@ def rule_overbooking(patient, appointments, threshold_protected, threshold_no_pr
                                 patient.assigned = True
                                 return appointments
 
-            # ── Branch B: Fallback to an empty slot (NOT overbooking) ──
+            # -- Branch B: Fallback to an empty slot (NOT overbooking) --
             # patient.overbooked stays False — no conflict occurred.
             if not patient.assigned:
                 for slot in range(len(appointments[0][dia])):
@@ -115,7 +124,7 @@ def fountain_overbooking(patient, patient_list, appointments,
 
         for dia in range(start_day, end_day):
 
-            # ── Branch A: Fountain primary assignment (NOT overbooking) ──
+            # -- Branch A: Fountain primary assignment (NOT overbooking) --
             # First `nivel_overbooking` empty slots of the day get filled regardless of eligibility.
             # These are single-patient slots — no conflict — so overbooked stays False.
             for i in range(0, nivel_overbooking):
@@ -126,7 +135,7 @@ def fountain_overbooking(patient, patient_list, appointments,
                     # patient.overbooked stays False ← key fix
                     return appointments
 
-            # ── Branch B: Real overbooking (stack onto an existing eligible patient) ──
+            # -- Branch B: Real overbooking (stack onto an existing eligible patient) --
             # Only eligible patients stack, and only onto other eligible patients.
             if not patient.assigned and overbook_eligible:
                 for server in range(len(appointments)):
@@ -143,7 +152,7 @@ def fountain_overbooking(patient, patient_list, appointments,
                                     patient.assigned = True
                                     return appointments
 
-            # ── Branch C: Fallback to any empty slot (NOT overbooking) ──
+            # -- Branch C: Fallback to any empty slot (NOT overbooking) --
             if not patient.assigned:
                 for slot in range(len(appointments[0][dia])):
                     for server in range(len(appointments)):
@@ -155,4 +164,92 @@ def fountain_overbooking(patient, patient_list, appointments,
                                 # patient.overbooked stays False ← key fix
                                 return appointments
 
+    return appointments
+
+def rule_simple_pairing(
+    patient,
+    patient_list,
+    appointments,
+    threshold_protected,
+    threshold_no_protected,
+    nivel_overbooking,
+):
+    """
+    Simple pairing overbooking rule with a per-day cap.
+
+    Mechanism:
+      - A patient is "flagged" if their predicted no-show probability
+        exceeds the group-specific threshold.
+      - A flagged patient stacks onto an existing single-booked slot
+        whose occupant is NON-flagged (predicted to attend).
+      - When the flagged patient *does* attend (false positive), a true
+        conflict occurs. Lower-PPV groups have more false positives,
+        so they accumulate more conflict-driven waiting time.
+
+    Per-day cap:
+      `nivel_overbooking` = maximum number of stacked slots per day,
+      counted globally across all servers.
+
+    Assignment priority per day:
+      1. If flagged AND day's cap not reached → try to pair with a
+         non-flagged single-booked occupant.
+      2. Otherwise → take the first empty slot.
+    """
+    # Reset state
+    patient.overbooked = False
+    patient.overbooked_target = False
+ 
+    if patient.protected:
+        flagged = patient.proba > threshold_protected
+    else:
+        flagged = patient.proba > threshold_no_protected
+ 
+    patient.overbooked_target = flagged
+ 
+    if patient.assigned:
+        return appointments
+ 
+    start_day = patient.day_of_call
+    end_day = len(appointments[0])
+ 
+    for dia in range(start_day, end_day):
+ 
+        # -- Step 1: flagged patient stacks onto a non-flagged slot ----------
+        if flagged:
+            # Recompute paired count from actual slot state — always exact.
+            paired_today = sum(
+                1
+                for server in range(len(appointments))
+                for slot_list in appointments[server][dia]
+                if sum(1 for pid in slot_list if pid is not None) >= 2
+            )
+ 
+            if paired_today < nivel_overbooking:
+                # Iterate slots before servers: distributes stacking across
+                # the day rather than clustering on the first server's slots.
+                for slot in range(len(appointments[0][dia])):
+                    for server in range(len(appointments)):
+                        current = appointments[server][dia][slot]
+                        if (len(current) == 1
+                                and current[0] is not None
+                                and not patient_list[current[0]].overbooked_target):
+                            # current[0] = non-flagged (already there, ids[0] in simulation)
+                            # current.append = flagged patient (ids[1] in simulation, bears WT cost)
+                            current.append(patient.id)
+                            patient.num_slot = slot
+                            patient.overbooked = True
+                            patient.assigned = True
+                            return appointments
+ 
+        # -- Step 2: fallback to the first empty slot ------------------------
+        # Also reached by flagged patients when cap is hit or no eligible
+        # partner exists. In that case overbooked stays False.
+        for slot in range(len(appointments[0][dia])):
+            for server in range(len(appointments)):
+                if appointments[server][dia][slot][0] is None:
+                    appointments[server][dia][slot][0] = patient.id
+                    patient.num_slot = slot
+                    patient.assigned = True
+                    return appointments
+ 
     return appointments
