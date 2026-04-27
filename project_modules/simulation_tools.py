@@ -3,8 +3,9 @@ from project_modules.project_imports import *
 from project_modules.classes import Patient, Clinic
 
 class Sampling:
-    def random_patient_sample(patients, sample_size, protected_pct, simulation_days):
-        # Pecentage of protected patients in the sample
+    @staticmethod
+    def random_patient_sample(patients, sample_size, protected_pct, simulation_days, high_proba_threshold=None):
+        # Percentage of protected patients in the sample
         protected_pct = protected_pct
 
         def asignar_dia(patient_list_sample, num_days):
@@ -27,12 +28,6 @@ class Sampling:
         protected_true = [patient for patient in patients if patient.protected]
         protected_false = [patient for patient in patients if not patient.protected]
 
-        high_proba_protected = [patient for patient in protected_true if patient.proba > 0.3]
-        high_proba_non_protected = [patient for patient in protected_false if patient.proba > 0.3]
-
-        assert type(high_proba_protected[0]) == Patient, "High proba protected patients in list must be Patient object"
-        assert type(high_proba_non_protected[0]) == Patient, "High proba non protected patients in list must be Patient object"
-
         # Calculate sample sizes for each group 
         total_sample_size = sample_size
         sample_size_protected_true = int(total_sample_size * protected_pct)
@@ -41,43 +36,55 @@ class Sampling:
         assert type(sample_size_protected_true) == int, "Protected sample size must be an integer"
         assert type(sample_size_protected_false) == int, "Non Protected sample size must be an integer"
 
-        # Inside random_patient_sample
-        n_high_protected = max(1, sample_size_protected_true // 10)
-        n_random_protected = sample_size_protected_true - n_high_protected
+        if high_proba_threshold is not None:
+            # --- High-probability-aware sampling (original logic, threshold now parametric) ---
+            high_proba_protected = [patient for patient in protected_true if patient.proba > high_proba_threshold]
+            high_proba_non_protected = [patient for patient in protected_false if patient.proba > high_proba_threshold]
 
-        # Pick high-proba first
-        high_indices = np.random.choice(len(high_proba_protected), n_high_protected, replace=False)
-        high_selected = [high_proba_protected[i] for i in high_indices]
-        high_selected_ids = {id(p) for p in high_selected}
+            assert type(high_proba_protected[0]) == Patient, "High proba protected patients in list must be Patient object"
+            assert type(high_proba_non_protected[0]) == Patient, "High proba non protected patients in list must be Patient object"
 
-        # Random pool excludes already-selected patients
-        remaining_protected = [p for p in protected_true if id(p) not in high_selected_ids]
-        random_indices = np.random.choice(len(remaining_protected), n_random_protected, replace=False)
+            n_high_protected = max(1, sample_size_protected_true // 10)
+            n_random_protected = sample_size_protected_true - n_high_protected
 
-        sample_protected_true = high_selected + [remaining_protected[i] for i in random_indices]
+            # Pick high-proba first
+            high_indices = np.random.choice(len(high_proba_protected), n_high_protected, replace=False)
+            high_selected = [high_proba_protected[i] for i in high_indices]
+            high_selected_ids = {id(p) for p in high_selected}
 
-        # Non-protected sample: pure random, no replacement
+            # Random pool excludes already-selected patients
+            remaining_protected = [p for p in protected_true if id(p) not in high_selected_ids]
+            random_indices = np.random.choice(len(remaining_protected), n_random_protected, replace=False)
+
+            sample_protected_true = high_selected + [remaining_protected[i] for i in random_indices]
+
+        else:
+            # --- Pure random sampling, no high-probability prioritization ---
+            random_indices = np.random.choice(len(protected_true), sample_size_protected_true, replace=False)
+            sample_protected_true = [protected_true[i] for i in random_indices]
+
+        # Non-protected sample: pure random, no replacement (unchanged)
         non_protected_indices = np.random.choice(len(protected_false), sample_size_protected_false, replace=False)
         sample_protected_false = [protected_false[i] for i in non_protected_indices]
 
         # Final stratified sample
         stratified_sample = sample_protected_true + sample_protected_false
 
-        # shuffle final sample
+        # Shuffle final sample
         np.random.shuffle(stratified_sample)
 
         stratified_sample = asignar_dia(stratified_sample, simulation_days)
 
-        orden_esperado = list(np.arange(0,sample_size,1)) 
+        orden_esperado = list(np.arange(0, sample_size, 1)) 
         ids_list = list([patient.id for patient in stratified_sample])
 
         if ids_list != orden_esperado:
-            # identificar los que estan en orden diferente
             for i in range(len(ids_list)):
                 if ids_list[i] != orden_esperado[i]:
                     stratified_sample[i].id = orden_esperado[i]
-                
+
         return stratified_sample
+
 random_patient_sample = Sampling.random_patient_sample
 
 class Plotting:
