@@ -16,6 +16,7 @@ class Patient:
         self.waiting_time = 0
         self.overbooked = False           # true conflict (double-booked)
         self.overbooked_target = False    # eligibility flag (proba > threshold)
+        self.displaced_once = False       # True after first N-slot displacement
 
         if self.regime_subsidized == 1:
             self.protected = True
@@ -25,7 +26,8 @@ class Patient:
         patient_data = patient_data.drop(columns=[
             'id', 'proba', 'protected', 'attendance',
             'assigned', 'day_of_call', 'num_slot',
-            'overbooked', 'overbooked_target', 'waiting_time'
+            'overbooked', 'overbooked_target', 'waiting_time',
+            'displaced_once',
         ])
         prediction = model.predict_proba(patient_data)[:, -1][0]
         self.proba = prediction
@@ -37,34 +39,65 @@ class Clinic:
         patients_data,
         appointments,
         slot_time,
+        displacement_offset: int = 1,
     ):
         """
         Parameters
         ----------
         patients_data : list of Patient
         appointments  : nested list produced by the scheduling rule.
-                        Service order within each slot is determined
-                        entirely by the rule — the simulation preserves
-                        it without reordering.
         slot_time     : int, slot duration in minutes.
+        displacement_offset : int, default 1.
+            N — how many slots forward to push an originally-booked flagged
+            stacker when a real conflict occurs at their booked slot.
  
         Service-order contract
         ----------------------
-        The simulation serves ids[0] at the booked slot and pushes
-        ids[1:] forward. Rules are responsible for placing patients in
-        the correct order when constructing slots:
-            index 0 → patient to be served first (non-flagged / predicted show)
-            index 1 → patient who bears the WT cost (flagged / predicted no-show)
+        At every slot t, the attending candidate pool is built from:
+          1. All patients currently in the slot list (cascade arrivals from
+             prior +1 pushes AND the slot's own anchor/stacker). Every
+             patient in the slot list who attends is always a candidate —
+             the N-slot rule governs where they go AFTER displacement, not
+             whether they participate in the conflict at their own booking.
+          2. Pending-buffer stackers — ONLY if pool from (1) is empty
+             (slot would be idle). Among pending stackers, any are eligible
+             regardless of N-fulfillment when the slot is idle. When the
+             slot is not idle, pending stackers who have fulfilled their
+             N-slot wait (slot_idx >= stacker.num_slot + N) are also served.
  
-        For rule_simple_pairing this is guaranteed by construction:
-        Step 2 places the non-flagged patient at current[0], then
-        Step 1 appends the flagged patient via current.append(), making
-        them current[1]. No sorting is applied here so cascade conflicts
-        do not compound waiting time beyond the original conflict slot.
+        Sort key: (num_slot, overbooked_target).
+          Cascade patients (num_slot < slot_idx) before own patients.
+          Among same num_slot: anchor (False=0) before stacker (True=1).
+ 
+        Displacement policy
+        -------------------
+        displacement_offset = 1 (default):
+            Standard cascade. Stacker prepended to slot+1 immediately.
+ 
+        displacement_offset = N > 1:
+            Models deferred-service rules without full mechanical complexity.
+            When a stacker is displaced from their ORIGINALLY BOOKED slot
+            for the first time (patient.displaced_once == False), they enter
+            a per-day pending buffer. The buffer is checked at every
+            subsequent slot:
+              - If the slot would be idle: serve the earliest pending stacker
+                regardless of N-fulfillment (idle intermediate slot rule).
+              - If the slot is not idle but slot_idx >= stacker.num_slot + N:
+                the stacker is eligible and included in the candidate pool.
+              - End of day: all remaining pending stackers are flushed to
+                overtime in num_slot order.
+ 
+            All other displaced patients (anchors bumped by cascade arrivals,
+            cascade patients bumped again, stackers already displaced once)
+            use standard +1 cascade push.
+ 
+            patient.displaced_once is set True after the first N-slot entry
+            into the buffer, preventing double-application of the N penalty.
         """
         self.appointments = appointments
         self.patients_list = patients_data
         self.slot_time = slot_time
+        self.displacement_offset = displacement_offset
  
         self.over_time = np.zeros(len(self.appointments))
         self.no_shows = 0
@@ -99,7 +132,6 @@ class Clinic:
         # Internal: track which patients have already been counted in CR
         # to enforce "at most once per patient."
         self._cr_counted_ids = set()
-
 
     def compute_waiting_time(self, slot, patient_id):
         """
@@ -153,7 +185,9 @@ class Clinic:
                 for slot_idx, slot in enumerate(dia):
                     occupants = [pid for pid in slot if pid is not None]
                     if len(occupants) >= 2:
-                        self.original_overbooked_slots[(server_idx, dia_idx, slot_idx)] = {
+                        self.original_overbooked_slots[
+                            (server_idx, dia_idx, slot_idx)
+                        ] = {
                             "anchor": occupants[0],
                             "stackers": occupants[1:],
                         }
@@ -187,7 +221,7 @@ class Clinic:
         # ============================================================
 
         crc_counted_ids = set()
-        for (server_idx, dia_idx, slot_idx), members in self.original_overbooked_slots.items():
+        for (_, _, _), members in self.original_overbooked_slots.items():
             anchor_id = members["anchor"]
             stackers = members["stackers"]
 
@@ -230,97 +264,199 @@ class Clinic:
             else:
                 self.cr_non_protected += 1
 
-    def simulation(self):
-        # Snapshot the schedule BEFORE any cascade mutations.
-        # Required for CRC to identify originally-overbooked slots.
-        self._snapshot_original_overbookings()
+    def _attending_from_slot_list(self, server_idx, dia_idx, slot_idx):
+        """
+        Return list of attending patient IDs from the current slot list,
+        sorted by (num_slot, overbooked_target).
+ 
+        Every patient in the slot list who attends is always a candidate,
+        regardless of displacement_offset. The N-slot rule governs where
+        they go AFTER displacement, not whether they participate here.
+        """
+        slot = self.appointments[server_idx][dia_idx][slot_idx]
+        attending = [
+            pid for pid in slot
+            if pid is not None and self.patients_list[pid].attendance
+        ]
+        attending.sort(key=lambda pid: (
+            self.patients_list[pid].num_slot,
+            self.patients_list[pid].overbooked_target,
+        ))
+        return attending
 
+    def _eligible_pending(self, slot_idx, pending_stackers):
+        """
+        Return pending-buffer stackers whose N-slot wait is fulfilled at
+        slot_idx (slot_idx >= stacker.num_slot + N), sorted by num_slot.
+ 
+        Used when the primary pool is non-empty — only fulfilled pending
+        stackers join the candidate pool in that case.
+        """
+        N = self.displacement_offset
+        eligible = [
+            pid for pid in pending_stackers
+            if slot_idx >= self.patients_list[pid].num_slot + N
+        ]
+        eligible.sort(key=lambda pid: self.patients_list[pid].num_slot)
+        return eligible
+ 
+    def _slot_has_attending_patient(self, server_idx, dia_idx, slot_idx):
+        """
+        True if any patient currently in the slot list will attend.
+        Used to detect idle intermediate slots during the N-slot scan.
+        Includes both originally scheduled patients and cascade arrivals.
+        Does NOT include pending-buffer stackers (not yet in any slot list).
+        """
+        slot = self.appointments[server_idx][dia_idx][slot_idx]
+        return any(
+            self.patients_list[pid].attendance
+            for pid in slot
+            if pid is not None
+        )
+
+    def simulation(self):
+        self._snapshot_original_overbookings()
+ 
+        N = self.displacement_offset
+ 
         for server_idx, server in enumerate(self.appointments):
             for dia_idx, dia in enumerate(server):
+ 
+                # Per-day pending buffer.
+                # Holds stackers displaced N slots who have not yet been
+                # committed to a specific future slot. Checked at every slot
+                # for idle-intermediate serving and N-fulfillment serving.
+                pending_stackers = []
+ 
                 for slot_idx, slot in enumerate(dia):
  
-                    # -- Empty or all-None slot: idle -------------------------
-                    if slot.count(None) == len(slot):
-                        self.idle_time_server[server_idx] += self.slot_time
-                        continue
+                    day_length = len(dia)
+                    is_last_slot = (slot_idx == day_length - 1)
  
-                    n_real = self.not_null(slot)
- 
-                    # -- Exactly one patient scheduled ------------------------
-                    if n_real == 1:
-                        patient_id = next(pid for pid in slot if pid is not None)
- 
-                        if not self.patients_list[patient_id].attendance:
-                            self.appointments[server_idx][dia_idx][slot_idx] = []
-                            self.idle_time_server[server_idx] += self.slot_time
+                    # ── Count no-shows for scheduled patients in this slot ─
+                    # Done before any serving so the count is always accurate.
+                    for pid in slot:
+                        if pid is not None and not self.patients_list[pid].attendance:
                             self.no_shows += 1
-                        else:
-                            self._record_attendance(patient_id, slot_idx)
  
-                    # -- More than one patient scheduled (overbooking) --------
+                    # ── Build primary candidate pool from slot list ────────
+                    primary = self._attending_from_slot_list(
+                        server_idx, dia_idx, slot_idx
+                    )
+ 
+                    # ── Add fulfilled pending stackers when slot not idle ──
+                    if primary:
+                        fulfilled = self._eligible_pending(
+                            slot_idx, pending_stackers
+                        )
+                        # Insert fulfilled pending stackers into primary,
+                        # maintaining sort order by (num_slot, overbooked_target).
+                        # Fulfilled stackers have num_slot < slot_idx so they
+                        # sort before the slot's own patients naturally.
+                        ids = sorted(
+                            primary + fulfilled,
+                            key=lambda pid: (
+                                self.patients_list[pid].num_slot,
+                                self.patients_list[pid].overbooked_target,
+                            )
+                        )
+                        # Remove fulfilled pending from buffer
+                        for pid in fulfilled:
+                            pending_stackers.remove(pid)
                     else:
                         ids = []
-                        for pid in slot:
-                            if pid is None:
-                                continue
-                            if self.patients_list[pid].attendance:
-                                ids.append(pid)
-                            else:
-                                self.no_shows += 1
  
-                        # Service order is preserved exactly as the rule constructed
-                        # the slot. No reordering is applied here.
-                        # For rule_simple_pairing:
-                        #   ids[0] = non-flagged patient (predicted show) → served at slot, WT=0
-                        #   ids[1] = flagged patient (predicted no-show who attended) → pushed forward, WT=slot_time
-                        # In downstream cascade slots, the pushed patient is at ids[0]
-                        # of the next slot (prepended via overflow + next_slot_existing),
-                        # so they are served there without being re-bumped again.
-                        self.appointments[server_idx][dia_idx][slot_idx] = ids if ids else []
- 
-                        if len(ids) == 0:
-                            self.idle_time_server[server_idx] += self.slot_time
- 
-                        elif len(ids) == 1:
-                            # Only one patient showed — no conflict, no push.
-                            self._record_attendance(ids[0], slot_idx)
- 
+                    # ── Idle slot: serve earliest pending stacker ─────────
+                    # When primary pool (slot list attending + fulfilled pending)
+                    # is empty, the slot is idle. Serve the earliest pending
+                    # stacker regardless of N-fulfillment.
+                    if not ids:
+                        if pending_stackers:
+                            pending_stackers.sort(
+                                key=lambda pid: self.patients_list[pid].num_slot
+                            )
+                            pid_serve = pending_stackers.pop(0)
+                            self._record_attendance(pid_serve, slot_idx)
                         else:
-                            is_last_slot = (
-                                slot_idx == len(self.appointments[server_idx][dia_idx]) - 1
+                            self.idle_time_server[server_idx] += self.slot_time
+                        continue
+ 
+                    # ── Update slot list to attending candidates ───────────
+                    self.appointments[server_idx][dia_idx][slot_idx] = ids[:]
+ 
+                    # ── One candidate: serve and done ─────────────────────
+                    if len(ids) == 1:
+                        self._record_attendance(ids[0], slot_idx)
+                        continue
+ 
+                    # ── Multiple candidates ───────────────────────────────
+                    if is_last_slot:
+                        # Overtime: serve all candidates then flush pending.
+                        # Pending stackers join the end of the queue in
+                        # num_slot order — they were waiting for a future
+                        # slot that no longer exists.
+                        # Merge ids and all remaining pending stackers into a
+                        # single list sorted by the unified rule (num_slot,
+                        # overbooked_target). This applies the same ordering
+                        # principle everywhere — pending stackers with an
+                        # earlier original slot interleave before the slot's
+                        # own anchor/stacker, not appended after them.
+                        all_overtime = sorted(
+                            ids + list(pending_stackers),
+                            key=lambda pid: (
+                                self.patients_list[pid].num_slot,
+                                self.patients_list[pid].overbooked_target,
+                            )
+                        )
+                        pending_stackers.clear()
+ 
+                        self.over_time[server_idx] += (
+                            self.slot_time * (len(all_overtime) - 1)
+                        )
+                        for i, pid in enumerate(all_overtime):
+                            self._record_attendance(pid, slot_idx + i)
+ 
+                    else:
+                        # ── Cascade branch ────────────────────────────────
+                        # ids[0] served here. ids[1:] displaced forward.
+                        self._record_attendance(ids[0], slot_idx)
+                        self.appointments[server_idx][dia_idx][slot_idx] = [
+                            ids[0]
+                        ]
+ 
+                        for pid in ids[1:]:
+                            patient = self.patients_list[pid]
+ 
+                            is_original_stacker = (
+                                patient.overbooked
+                                and patient.num_slot == slot_idx
+                                and not patient.displaced_once
                             )
  
-                            if is_last_slot:
-                                # Overtime: all patients attend simultaneously.
-                                # Every patient in ids bears the waiting-time cost.
-                                # NOTE: conflict_slots_* increments removed — CRC/CR
-                                # are computed in the post-pass _compute_conflict_metrics().
-                                self.over_time[server_idx] += self.slot_time * (len(ids) - 1)
-                                for i, pid in enumerate(ids):
-                                    self._record_attendance(pid, slot_idx + i)
+                            if is_original_stacker and N > 1:
+                                # First N-slot displacement: enter pending buffer.
+                                # The buffer handles idle-intermediate landing
+                                # and N-fulfillment serving at future slots.
+                                patient.displaced_once = True
+                                pending_stackers.append(pid)
  
                             else:
-                              # Cascade: ids[0] served at this slot. ids[1:] prepended
-                                # to the next slot's list and processed there.
-                                # Because overflow is prepended (overflow + next_slot_existing),
-                                # the pushed patient becomes ids[0] of the next slot and is
-                                # served there without being re-bumped — unless the next slot
-                                # also has two attendees, which is a separate independent event.
-                                # NOTE: conflict_slots_* increment removed — see above.
-                                self._record_attendance(ids[0], slot_idx)
-                                self.appointments[server_idx][dia_idx][slot_idx] = [ids[0]]
- 
-                                overflow = ids[1:]
-                                next_slot_existing = [
-                                    pid for pid in
+                                # Standard +1 cascade push:
+                                #   - N=1 original stacker (same as current behavior)
+                                #   - Anchors bumped by cascade arrivals
+                                #   - Cascade patients bumped again
+                                #   - Stackers already displaced once
+                                if is_original_stacker and N == 1:
+                                    patient.displaced_once = True
+                                next_existing = [
+                                    p for p in
                                     self.appointments[server_idx][dia_idx][slot_idx + 1]
-                                    if pid is not None
+                                    if p is not None
                                 ]
                                 self.appointments[server_idx][dia_idx][slot_idx + 1] = (
-                                    overflow + next_slot_existing
+                                    [pid] + next_existing
                                 )
-        # Post-pass: compute CRC and CR from snapshot + recorded waiting times.
-        # Must run after the simulation loop so all waiting_time values are set.
+ 
         self._compute_conflict_metrics()
  
     def not_null(self, lista):
@@ -371,7 +507,6 @@ class Clinic:
                 self.cr_non_protected / self.non_protected_assistance
                 if self.non_protected_assistance > 0 else 0
             ),
-
 
             "protected_mean_wt": (
                 self.cwt_protected / self.protected_assistance
