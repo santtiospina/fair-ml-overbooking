@@ -81,11 +81,26 @@ class Clinic:
         self.protected_overbooked_waiting_time = 0
         self.non_protected_overbooked_waiting_time = 0
         self.total_attended_patients = 0
- 
-        # Conflict-slot diagnostics: counts patients in slots where ≥2 actually attended
-        self.conflict_slots_protected = 0
-        self.conflict_slots_non_protected = 0
- 
+
+        # Snapshot of originally-overbooked slots, captured before simulation runs.
+        self.original_overbooked_slots = {}
+        
+        # CRC: counts patients who were stackers at an originally-overbooked slot
+        # where BOTH anchor and stacker attended (a real conflict at the original slot).
+        self.crc_protected = 0
+        self.crc_non_protected = 0
+
+        # CR: counts patients who were displaced from their originally-booked slot
+        # (waiting_time > 0 for any reason — direct push or cascade victim).
+        # Each patient counted at most once (deduplicated by id).
+        self.cr_protected = 0
+        self.cr_non_protected = 0
+
+        # Internal: track which patients have already been counted in CR
+        # to enforce "at most once per patient."
+        self._cr_counted_ids = set()
+
+
     def compute_waiting_time(self, slot, patient_id):
         """
         Waiting time = slots delayed past original booking * slot_time (minutes).
@@ -118,7 +133,108 @@ class Clinic:
                 self.non_protected_overbooked_patients += 1
                 self.non_protected_overbooked_waiting_time += wt
  
+    def _snapshot_original_overbookings(self):
+        """
+        Captures the originally-overbooked slots as constructed by the rule,
+        BEFORE simulation() mutates the schedule via cascade pushes.
+ 
+        Creates a new list of occupant IDs per slot (not a reference to the
+        slot list itself), so the snapshot is safe from in-place mutations.
+ 
+        Stored in self.original_overbooked_slots as:
+            {(server_idx, dia_idx, slot_idx): {
+                "anchor":   pid at index 0,
+                "stackers": [pid at index 1, ...]
+            }}
+        """
+        self.original_overbooked_slots = {}
+        for server_idx, server in enumerate(self.appointments):
+            for dia_idx, dia in enumerate(server):
+                for slot_idx, slot in enumerate(dia):
+                    occupants = [pid for pid in slot if pid is not None]
+                    if len(occupants) >= 2:
+                        self.original_overbooked_slots[(server_idx, dia_idx, slot_idx)] = {
+                            "anchor": occupants[0],
+                            "stackers": occupants[1:],
+                        }
+
+    def _compute_conflict_metrics(self):
+        """
+        Post-simulation pass that computes CRC and CR from the snapshot and
+        the per-patient waiting times recorded during simulation().
+ 
+        Must be called AFTER simulation() completes — it relies on
+        patient.waiting_time being set by _record_attendance().
+ 
+        CRC
+        ---
+        For each originally-overbooked slot: if the anchor attended AND at
+        least one stacker also attended, count each attending stacker once
+        for their group. The anchor is never counted. Cascade-victim slots
+        (not in the snapshot) are never counted.
+ 
+        CR
+        ---
+        Walk all patients. Any attendee whose waiting_time > 0 was displaced
+        from their originally-booked slot — count them once for their group.
+        The deduplication set _cr_counted_ids prevents double-counting for
+        patients who pass through multiple cascade steps.
+        """
+        # ============================================================
+        # #                           CRC                            #
+        # #                      Walk snapshot                       #
+        # #      Check attendance at original-overbooked slots       #
+        # ============================================================
+
+        crc_counted_ids = set()
+        for (server_idx, dia_idx, slot_idx), members in self.original_overbooked_slots.items():
+            anchor_id = members["anchor"]
+            stackers = members["stackers"]
+
+            anchor_attended = self.patients_list[anchor_id].attendance
+            if not anchor_attended:
+                # No real conflict at the originally-overbooked slot — anchor absent.
+                continue
+
+            for stacker_id in stackers:
+                stacker_attended = self.patients_list[stacker_id].attendance
+                if not stacker_attended:
+                    continue
+                # Real original conflict: both anchor and this stacker attended.
+                if stacker_id in crc_counted_ids:
+                    continue  # already counted (defensive; rule shouldn't double-stack)
+                crc_counted_ids.add(stacker_id)
+                if self.patients_list[stacker_id].protected:
+                    self.crc_protected += 1
+                else:
+                    self.crc_non_protected += 1
+
+        # ============================================================
+        # #                            CR                            #
+        # #                  Walk the patients list                  #
+        # #         Count any attendee with waiting_time > 0         #
+        # ============================================================
+
+        for patient in self.patients_list:
+            if not patient.attendance:
+                continue
+            if not patient.assigned:
+                continue
+            if patient.waiting_time <= 0:
+                continue
+            if patient.id in self._cr_counted_ids:
+                continue
+            self._cr_counted_ids.add(patient.id)
+            if patient.protected:
+                self.cr_protected += 1
+            else:
+                self.cr_non_protected += 1
+
     def simulation(self):
+        # Snapshot the schedule BEFORE any cascade mutations.
+        # Required for CRC to identify originally-overbooked slots.
+        self._snapshot_original_overbookings()
+
         for server_idx, server in enumerate(self.appointments):
             for dia_idx, dia in enumerate(server):
                 for slot_idx, slot in enumerate(dia):
@@ -176,31 +292,21 @@ class Clinic:
  
                             if is_last_slot:
                                 # Overtime: all patients attend simultaneously.
-                                # Every patient in ids bears the conflict cost.
-                                for pid in ids:
-                                    if self.patients_list[pid].protected:
-                                        self.conflict_slots_protected += 1
-                                    else:
-                                        self.conflict_slots_non_protected += 1
- 
+                                # Every patient in ids bears the waiting-time cost.
+                                # NOTE: conflict_slots_* increments removed — CRC/CR
+                                # are computed in the post-pass _compute_conflict_metrics().
                                 self.over_time[server_idx] += self.slot_time * (len(ids) - 1)
                                 for i, pid in enumerate(ids):
                                     self._record_attendance(pid, slot_idx + i)
  
                             else:
-                                # Cascade: ids[0] served at this slot (WT = accumulated delay
-                                # from any prior pushes, 0 if this is the original booking).
-                                # ids[1:] prepended to the next slot's list and processed there.
+                              # Cascade: ids[0] served at this slot. ids[1:] prepended
+                                # to the next slot's list and processed there.
                                 # Because overflow is prepended (overflow + next_slot_existing),
                                 # the pushed patient becomes ids[0] of the next slot and is
-                                # served there — they are not re-bumped a second time unless
-                                # the next slot also has two attendees.
-                                pid0 = ids[0]
-                                if self.patients_list[pid0].protected:
-                                    self.conflict_slots_protected += 1
-                                else:
-                                    self.conflict_slots_non_protected += 1
- 
+                                # served there without being re-bumped — unless the next slot
+                                # also has two attendees, which is a separate independent event.
+                                # NOTE: conflict_slots_* increment removed — see above.
                                 self._record_attendance(ids[0], slot_idx)
                                 self.appointments[server_idx][dia_idx][slot_idx] = [ids[0]]
  
@@ -213,6 +319,9 @@ class Clinic:
                                 self.appointments[server_idx][dia_idx][slot_idx + 1] = (
                                     overflow + next_slot_existing
                                 )
+        # Post-pass: compute CRC and CR from snapshot + recorded waiting times.
+        # Must run after the simulation loop so all waiting_time values are set.
+        self._compute_conflict_metrics()
  
     def not_null(self, lista):
         return max(len(lista) - lista.count(None), 0)
@@ -238,18 +347,32 @@ class Clinic:
                 total_waiting_time / self.total_attended_patients
                 if self.total_attended_patients > 0 else 0
             ),
-            # Conflict-slot raw counts
-            "conflict_slots_protected": self.conflict_slots_protected,
-            "conflict_slots_non_protected": self.conflict_slots_non_protected,
-            # Conflict-slot rates — normalized by attendance
-            "conflict_rate_protected": (
-                self.conflict_slots_protected / self.protected_assistance
+
+            # CRC: cause-attributed conflict counts (stackers at original-conflict slots)
+            "crc_protected": self.crc_protected,
+            "crc_non_protected": self.crc_non_protected,
+            "crc_rate_protected": (
+                self.crc_protected / self.protected_assistance
                 if self.protected_assistance > 0 else 0
             ),
-            "conflict_rate_non_protected": (
-                self.conflict_slots_non_protected / self.non_protected_assistance
+            "crc_rate_non_protected": (
+                self.crc_non_protected / self.non_protected_assistance
                 if self.non_protected_assistance > 0 else 0
             ),
+
+            # CR: any displacement (stacker losing original conflict OR cascade victim)
+            "cr_protected": self.cr_protected,
+            "cr_non_protected": self.cr_non_protected,
+            "cr_rate_protected": (
+                self.cr_protected / self.protected_assistance
+                if self.protected_assistance > 0 else 0
+            ),
+            "cr_rate_non_protected": (
+                self.cr_non_protected / self.non_protected_assistance
+                if self.non_protected_assistance > 0 else 0
+            ),
+
+
             "protected_mean_wt": (
                 self.cwt_protected / self.protected_assistance
                 if self.protected_assistance > 0 else 0

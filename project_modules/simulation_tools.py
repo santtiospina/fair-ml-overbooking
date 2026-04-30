@@ -193,12 +193,12 @@ class Processing:
 
         if key_metrics is None:
             key_metrics = [
-                "conflict_rate_protected",
-                "conflict_rate_non_protected",
-                "protected_overbooked_waiting_time",
-                "non_protected_overbooked_waiting_time",
-                "conflict_slots_protected",
-                "conflict_slots_non_protected",
+                "crc_rate_protected",
+                "crc_rate_non_protected",
+                "cr_rate_protected",
+                "cr_rate_non_protected",
+                "protected_mean_wt",
+                "non_protected_mean_wt",
             ]
 
         worst_diff = None
@@ -208,23 +208,23 @@ class Processing:
                 continue
             margin_error = results[key]['margin_of_error']
             mean = results[key]['mean']
-
+ 
             if mean == 0 or np.isnan(mean):
                 continue
-
+ 
             diff = margin_error / abs(mean)
-
+ 
             if verbose:
                 print(f"  [convergence] {key:40s} margin/mean = {diff:.4f}")
-
+ 
             if worst_diff is None or diff > worst_diff:
                 worst_diff = diff
                 worst_key  = key
-
+ 
         if worst_diff is None:
             # No key metric had non-zero mean — treat as converged
             return True, 0.0
-
+ 
         converged = worst_diff <= converge_mean
         if verbose:
             print(f"  [convergence] worst: {worst_key} @ {worst_diff:.4f} "
