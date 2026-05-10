@@ -133,6 +133,36 @@ class Clinic:
         # to enforce "at most once per patient."
         self._cr_counted_ids = set()
 
+        # CR-flagged: displacements (waiting_time > 0) restricted to flagged
+        # patients. Numerator counts flagged attendees displaced; denominator
+        # (cr_flagged_*_assigned) counts all flagged attendees in the group.
+        self.cr_flagged_protected = 0
+        self.cr_flagged_non_protected = 0
+
+        # Waiting time accumulated by flagged attendees (proba > group threshold).
+        # Sum of waiting_time across all flagged patients who attended,
+        # regardless of slot position (anchor, stacker, or alone).
+        self.cwt_flagged_protected = 0
+        self.cwt_flagged_non_protected = 0
+
+        # Waiting time accumulated by TRULY STACKED patients (overbooked == True).
+        # Distinct from cwt_flagged_*, which uses overbooked_target. The truly-stacked
+        # pool excludes flagged patients who fell through to fallback empty slots.
+        self.cwt_stacked_protected = 0
+        self.cwt_stacked_non_protected = 0
+
+        # Displacement count restricted to truly-stacked patients.
+        self.cr_stacked_protected = 0
+        self.cr_stacked_non_protected = 0
+        
+        # Displacement diagnostics — track how the N-slot penalty is resolved.
+        self.idle_rule_served = 0
+        self.n_fulfilled_served = 0
+
+        # Track each group's count of patients placed as flagged stackers by the rule (regardless of whether they attended)
+        self.protected_overbooked_assigned = 0
+        self.non_protected_overbooked_assigned = 0
+
     def compute_waiting_time(self, slot, patient_id):
         """
         Waiting time = slots delayed past original booking * slot_time (minutes).
@@ -149,14 +179,26 @@ class Clinic:
         patient = self.patients_list[patient_id]
         patient.waiting_time = wt
         self.total_attended_patients += 1
- 
+
         if patient.protected:
             self.cwt_protected += wt
             self.protected_assistance += 1
         else:
             self.cwt_non_protected += wt
             self.non_protected_assistance += 1
- 
+
+        if patient.overbooked_target:
+            if patient.protected:
+                self.cwt_flagged_protected += wt
+            else:
+                self.cwt_flagged_non_protected += wt
+
+        if patient.overbooked:
+            if patient.protected:
+                self.cwt_stacked_protected += wt
+            else:
+                self.cwt_stacked_non_protected += wt
+
         if patient.overbooked and patient.assigned:
             if patient.protected:
                 self.protected_overbooked_patients += 1
@@ -191,6 +233,11 @@ class Clinic:
                             "anchor": occupants[0],
                             "stackers": occupants[1:],
                         }
+                        for stacker_id in occupants[1:]:
+                            if self.patients_list[stacker_id].protected:
+                                self.protected_overbooked_assigned += 1
+                            else:
+                                self.non_protected_overbooked_assigned += 1
 
     def _compute_conflict_metrics(self):
         """
@@ -263,6 +310,17 @@ class Clinic:
                 self.cr_protected += 1
             else:
                 self.cr_non_protected += 1
+            if patient.overbooked_target:
+                if patient.protected:
+                    self.cr_flagged_protected += 1
+                else:
+                    self.cr_flagged_non_protected += 1
+
+            if patient.overbooked:
+                if patient.protected:
+                    self.cr_stacked_protected += 1
+                else:
+                    self.cr_stacked_non_protected += 1
 
     def _attending_from_slot_list(self, server_idx, dia_idx, slot_idx):
         """
@@ -333,18 +391,18 @@ class Clinic:
                     day_length = len(dia)
                     is_last_slot = (slot_idx == day_length - 1)
  
-                    # ── Count no-shows for scheduled patients in this slot ─
+                    # -- Count no-shows for scheduled patients in this slot -
                     # Done before any serving so the count is always accurate.
                     for pid in slot:
                         if pid is not None and not self.patients_list[pid].attendance:
                             self.no_shows += 1
  
-                    # ── Build primary candidate pool from slot list ────────
+                    # -- Build primary candidate pool from slot list --------
                     primary = self._attending_from_slot_list(
                         server_idx, dia_idx, slot_idx
                     )
  
-                    # ── Add fulfilled pending stackers when slot not idle ──
+                    # -- Add fulfilled pending stackers when slot not idle --
                     if primary:
                         fulfilled = self._eligible_pending(
                             slot_idx, pending_stackers
@@ -363,10 +421,13 @@ class Clinic:
                         # Remove fulfilled pending from buffer
                         for pid in fulfilled:
                             pending_stackers.remove(pid)
+
+                        self.n_fulfilled_served += len(fulfilled)
+
                     else:
                         ids = []
  
-                    # ── Idle slot: serve earliest pending stacker ─────────
+                    # -- Idle slot: serve earliest pending stacker ---------
                     # When primary pool (slot list attending + fulfilled pending)
                     # is empty, the slot is idle. Serve the earliest pending
                     # stacker regardless of N-fulfillment.
@@ -376,20 +437,21 @@ class Clinic:
                                 key=lambda pid: self.patients_list[pid].num_slot
                             )
                             pid_serve = pending_stackers.pop(0)
+                            self.idle_rule_served += 1
                             self._record_attendance(pid_serve, slot_idx)
                         else:
                             self.idle_time_server[server_idx] += self.slot_time
                         continue
  
-                    # ── Update slot list to attending candidates ───────────
+                    # -- Update slot list to attending candidates -----------
                     self.appointments[server_idx][dia_idx][slot_idx] = ids[:]
  
-                    # ── One candidate: serve and done ─────────────────────
+                    # -- One candidate: serve and done ---------------------
                     if len(ids) == 1:
                         self._record_attendance(ids[0], slot_idx)
                         continue
  
-                    # ── Multiple candidates ───────────────────────────────
+                    # -- Multiple candidates -------------------------------
                     if is_last_slot:
                         # Overtime: serve all candidates then flush pending.
                         # Pending stackers join the end of the queue in
@@ -417,7 +479,7 @@ class Clinic:
                             self._record_attendance(pid, slot_idx + i)
  
                     else:
-                        # ── Cascade branch ────────────────────────────────
+                        # -- Cascade branch --------------------------------
                         # ids[0] served here. ids[1:] displaced forward.
                         self._record_attendance(ids[0], slot_idx)
                         self.appointments[server_idx][dia_idx][slot_idx] = [
@@ -464,7 +526,27 @@ class Clinic:
  
     def get_measures(self):
         total_waiting_time = self.cwt_protected + self.cwt_non_protected
- 
+
+        total_displacement_events = self.idle_rule_served + self.n_fulfilled_served
+
+        flagged_protected_attendees = sum(
+            1 for p in self.patients_list
+            if p.attendance and p.assigned and p.overbooked_target and p.protected
+        )
+        flagged_non_protected_attendees = sum(
+            1 for p in self.patients_list
+            if p.attendance and p.assigned and p.overbooked_target and not p.protected
+        )
+
+        stacked_protected_attendees = sum(
+            1 for p in self.patients_list
+            if p.attendance and p.assigned and p.overbooked and p.protected
+        )
+        stacked_non_protected_attendees = sum(
+            1 for p in self.patients_list
+            if p.attendance and p.assigned and p.overbooked and not p.protected
+        )
+
         measures = {
             "idle_time_server": self.idle_time_server.tolist(),
             "over_time": self.over_time.tolist(),
@@ -484,6 +566,41 @@ class Clinic:
                 if self.total_attended_patients > 0 else 0
             ),
 
+            "cwt_flagged_protected":     self.cwt_flagged_protected,
+            "cwt_flagged_non_protected": self.cwt_flagged_non_protected,
+            "wt_flagged_mean_protected": (
+                self.cwt_flagged_protected / flagged_protected_attendees
+                if flagged_protected_attendees > 0 else 0
+            ),
+            "wt_flagged_mean_non_protected": (
+                self.cwt_flagged_non_protected / flagged_non_protected_attendees
+                if flagged_non_protected_attendees > 0 else 0
+            ),
+
+            # True-stacker metrics (overbooked == True). Population is patients
+            "cwt_stacked_protected":     self.cwt_stacked_protected,
+            "cwt_stacked_non_protected": self.cwt_stacked_non_protected,
+            "wt_stacked_mean_protected": (
+                self.cwt_stacked_protected / stacked_protected_attendees
+                if stacked_protected_attendees > 0 else 0
+            ),
+            "wt_stacked_mean_non_protected": (
+                self.cwt_stacked_non_protected / stacked_non_protected_attendees
+                if stacked_non_protected_attendees > 0 else 0
+            ),
+            "cr_stacked_protected":     self.cr_stacked_protected,
+            "cr_stacked_non_protected": self.cr_stacked_non_protected,
+            "cr_stacked_rate_protected": (
+                self.cr_stacked_protected / stacked_protected_attendees
+                if stacked_protected_attendees > 0 else 0
+            ),
+            "cr_stacked_rate_non_protected": (
+                self.cr_stacked_non_protected / stacked_non_protected_attendees
+                if stacked_non_protected_attendees > 0 else 0
+            ),
+            "stacked_protected_attendees":     stacked_protected_attendees,
+            "stacked_non_protected_attendees": stacked_non_protected_attendees,
+
             # CRC: cause-attributed conflict counts (stackers at original-conflict slots)
             "crc_protected": self.crc_protected,
             "crc_non_protected": self.crc_non_protected,
@@ -495,6 +612,20 @@ class Clinic:
                 self.crc_non_protected / self.non_protected_assistance
                 if self.non_protected_assistance > 0 else 0
             ),
+
+            # CRC normalized by overbooked-assigned population.
+            # Measures: of patients placed as overbooking stackers, what fraction
+            # experienced a real conflict (anchor also attended)?
+            "crc_rate_overbooked_protected": (
+                self.crc_protected / self.protected_overbooked_assigned
+                if self.protected_overbooked_assigned > 0 else 0
+            ),
+            "crc_rate_overbooked_non_protected": (
+                self.crc_non_protected / self.non_protected_overbooked_assigned
+                if self.non_protected_overbooked_assigned > 0 else 0
+            ),
+            "protected_overbooked_assigned":     self.protected_overbooked_assigned,
+            "non_protected_overbooked_assigned": self.non_protected_overbooked_assigned,
 
             # CR: any displacement (stacker losing original conflict OR cascade victim)
             "cr_protected": self.cr_protected,
@@ -515,6 +646,38 @@ class Clinic:
             "non_protected_mean_wt": (
                 self.cwt_non_protected / self.non_protected_assistance
                 if self.non_protected_assistance > 0 else 0
+            ),
+
+            # CR-flagged: any displacement (waiting_time > 0) restricted
+            # to flagged patients (proba > group threshold). Isolates the
+            # subset of patients on whom the overbooking rule operates.
+            "cr_flagged_protected": self.cr_flagged_protected,
+            "cr_flagged_non_protected": self.cr_flagged_non_protected,
+            "cr_flagged_rate_protected": (
+                self.cr_flagged_protected / flagged_protected_attendees
+                if flagged_protected_attendees > 0 else 0
+            ),
+            "cr_flagged_rate_non_protected": (
+                self.cr_flagged_non_protected / flagged_non_protected_attendees
+                if flagged_non_protected_attendees > 0 else 0
+            ),
+            "flagged_protected_attendees":     flagged_protected_attendees,
+            "flagged_non_protected_attendees": flagged_non_protected_attendees,
+
+            # Displacement diagnostics
+            # idle_rule_served: pending stackers absorbed at idle slots
+            #   before N-wait elapsed. High values mean the N penalty is
+            #   being short-circuited by no-shows in intermediate slots.
+            # n_fulfilled_served: pending stackers who waited the full N
+            #   slots. High values mean N is being applied in full.
+            # idle_absorption_rate: fraction of displacement events resolved
+            #   by the idle rule. Near 1.0 → N has little WT effect.
+            #   Near 0.0 → N is fully applied.
+            "idle_rule_served":      self.idle_rule_served,
+            "n_fulfilled_served":    self.n_fulfilled_served,
+            "idle_absorption_rate": (
+                self.idle_rule_served / total_displacement_events
+                if total_displacement_events > 0 else 0
             ),
         }
         return measures

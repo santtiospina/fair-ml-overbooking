@@ -101,9 +101,14 @@ def rule_overbooking(patient, appointments, threshold_protected, threshold_no_pr
                                 return appointments
     return appointments
 
-def fountain_overbooking(patient, patient_list, appointments,
-                         threshold_protected, threshold_no_protected,
-                         nivel_overbooking, train_model):
+def fountain_overbooking(
+    patient,
+    patient_list,
+    appointments,
+    threshold_protected,
+    threshold_no_protected,
+    nivel_overbooking,
+):
 
     # Reset flags
     patient.overbooked = False
