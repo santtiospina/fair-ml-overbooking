@@ -17,19 +17,40 @@ def call_a_rule(
             appointments = fcfa(patient, appointments)
         elif name_rule == 'overbooking_simple':
             appointments = rule_overbooking(
-                patient, appointments,
-                threshold_protected, threshold_no_protected,
-                overbooking_level, ml_model)
+                patient,
+                appointments,
+                threshold_protected,
+                threshold_no_protected,
+                overbooking_level,
+                ml_model
+            )
         elif name_rule == 'fountain':
             appointments = fountain_overbooking(
-                patient, patient_list, appointments,
-                threshold_protected, threshold_no_protected,
-                overbooking_level, ml_model)
+                patient,
+                patient_list,
+                appointments,
+                threshold_protected,
+                threshold_no_protected,
+                overbooking_level,
+            )
         elif name_rule == 'simple_pairing':
             appointments = rule_simple_pairing(
-                patient, patient_list, appointments,
-                threshold_protected, threshold_no_protected,
-                overbooking_level)
+                patient,
+                patient_list,
+                appointments,
+                threshold_protected,
+                threshold_no_protected,
+                overbooking_level
+            )
+        elif name_rule == 'flagged_pairing':
+            appointments = rule_flagged_pairing(
+                patient,
+                patient_list,
+                appointments,
+                threshold_protected,
+                threshold_no_protected,
+                overbooking_level,
+            )
         else:
             print("Unknown name_rule")
 
@@ -257,4 +278,102 @@ def rule_simple_pairing(
                     patient.assigned = True
                     return appointments
  
+    return appointments
+
+def rule_flagged_pairing(
+    patient,
+    patient_list,
+    appointments,
+    threshold_protected,
+    threshold_no_protected,
+    nivel_overbooking,
+):
+    """
+    Flagged-onto-flagged pairing overbooking rule with a per-day cap.
+
+    Mechanism:
+      - A patient is "flagged" if their predicted no-show probability
+        exceeds the group-specific threshold.
+      - A flagged patient stacks onto an existing single-booked slot
+        whose occupant is ALSO flagged.
+      - A real conflict at an originally-overbooked slot occurs only
+        when BOTH flagged patients attend, i.e. when both are false
+        positives. The per-slot conflict probability is therefore
+        (1 - PPV_anchor) * (1 - PPV_stacker), which is much lower than
+        the (1 - PPV) * NPV of the non-flagged-onto-flagged rule but
+        amplifies the per-slot disparity between groups when both
+        slot occupants belong to the same group.
+
+    Per-day cap:
+      `nivel_overbooking` = maximum number of stacked slots per day,
+      counted globally across all servers.
+
+    Assignment priority per day:
+      1. If flagged AND day's cap not reached → try to pair with a
+         flagged single-booked occupant.
+      2. Otherwise → take the first empty slot.
+         (Non-flagged patients always take this path.)
+    """
+    # Reset state
+    patient.overbooked = False
+    patient.overbooked_target = False
+
+    if patient.protected:
+        flagged = patient.proba > threshold_protected
+    else:
+        flagged = patient.proba > threshold_no_protected
+
+    patient.overbooked_target = flagged
+
+    if patient.assigned:
+        return appointments
+
+    start_day = patient.day_of_call
+    end_day = len(appointments[0])
+
+    for dia in range(start_day, end_day):
+
+        # -- Step 1: flagged patient stacks onto a flagged single-booked slot
+        if flagged:
+            # Recompute paired count from actual slot state — always exact.
+            paired_today = sum(
+                1
+                for server in range(len(appointments))
+                for slot_list in appointments[server][dia]
+                if sum(1 for pid in slot_list if pid is not None) >= 2
+            )
+
+            if paired_today < nivel_overbooking:
+                # Iterate slots before servers: distributes stacking across
+                # the day rather than clustering on the first server's slots.
+                for slot in range(len(appointments[0][dia])):
+                    for server in range(len(appointments)):
+                        current = appointments[server][dia][slot]
+                        if (len(current) == 1
+                                and current[0] is not None
+                                and patient_list[current[0]].overbooked_target):
+                            # Existing occupant is flagged — pair with them.
+                            # current[0] = flagged anchor (ids[0] in simulation)
+                            # current.append = flagged stacker (ids[1] in
+                            # simulation, bears WT cost on conflict).
+                            current.append(patient.id)
+                            patient.num_slot = slot
+                            patient.overbooked = True
+                            patient.assigned = True
+                            return appointments
+
+        # -- Step 2: fallback to the first empty slot ------------------------
+        # Reached by:
+        #   - non-flagged patients (always)
+        #   - flagged patients when no flagged partner exists yet
+        #   - flagged patients when the day's cap is already filled
+        # In all these cases overbooked stays False.
+        for slot in range(len(appointments[0][dia])):
+            for server in range(len(appointments)):
+                if appointments[server][dia][slot][0] is None:
+                    appointments[server][dia][slot][0] = patient.id
+                    patient.num_slot = slot
+                    patient.assigned = True
+                    return appointments
+
     return appointments
