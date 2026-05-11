@@ -9,7 +9,8 @@ def call_a_rule(
     ml_model,
     threshold_protected,
     threshold_no_protected,
-    overbooking_level
+    overbooking_level,
+    min_stack_slot=0,
 ):
     refused_patients = 0
     for patient in patient_list:
@@ -40,7 +41,8 @@ def call_a_rule(
                 appointments,
                 threshold_protected,
                 threshold_no_protected,
-                overbooking_level
+                overbooking_level,
+                min_stack_slot,
             )
         elif name_rule == 'flagged_pairing':
             appointments = rule_flagged_pairing(
@@ -50,6 +52,7 @@ def call_a_rule(
                 threshold_protected,
                 threshold_no_protected,
                 overbooking_level,
+                min_stack_slot,
             )
         else:
             print("Unknown name_rule")
@@ -199,6 +202,7 @@ def rule_simple_pairing(
     threshold_protected,
     threshold_no_protected,
     nivel_overbooking,
+    min_stack_slot=0,
 ):
     """
     Simple pairing overbooking rule with a per-day cap.
@@ -215,6 +219,13 @@ def rule_simple_pairing(
     Per-day cap:
       `nivel_overbooking` = maximum number of stacked slots per day,
       counted globally across all servers.
+
+    min_stack_slot:
+    The first `min_stack_slot` slots of each day are excluded from Step 1
+    (stacking). Step 2 (anchor placement) is unaffected — anchors still
+    fill from slot 0 as normal. Setting min_stack_slot > 0 places conflicts
+    later in the day, reducing cascade depth and end-of-day overtime.
+    Default 0 preserves the original behavior.
 
     Assignment priority per day:
       1. If flagged AND day's cap not reached → try to pair with a
@@ -251,16 +262,12 @@ def rule_simple_pairing(
             )
  
             if paired_today < nivel_overbooking:
-                # Iterate slots before servers: distributes stacking across
-                # the day rather than clustering on the first server's slots.
-                for slot in range(len(appointments[0][dia])):
+                for slot in range(min_stack_slot, len(appointments[0][dia])):
                     for server in range(len(appointments)):
                         current = appointments[server][dia][slot]
                         if (len(current) == 1
                                 and current[0] is not None
                                 and not patient_list[current[0]].overbooked_target):
-                            # current[0] = non-flagged (already there, ids[0] in simulation)
-                            # current.append = flagged patient (ids[1] in simulation, bears WT cost)
                             current.append(patient.id)
                             patient.num_slot = slot
                             patient.overbooked = True
@@ -287,6 +294,7 @@ def rule_flagged_pairing(
     threshold_protected,
     threshold_no_protected,
     nivel_overbooking,
+    min_stack_slot=0,
 ):
     """
     Flagged-onto-flagged pairing overbooking rule with a per-day cap.
@@ -307,6 +315,13 @@ def rule_flagged_pairing(
     Per-day cap:
       `nivel_overbooking` = maximum number of stacked slots per day,
       counted globally across all servers.
+
+    min_stack_slot:
+    The first `min_stack_slot` slots of each day are excluded from Step 1
+    (stacking). Step 2 (anchor placement) is unaffected — anchors still
+    fill from slot 0 as normal. Setting min_stack_slot > 0 places conflicts
+    later in the day, reducing cascade depth and end-of-day overtime.
+    Default 0 preserves the original behavior.
 
     Assignment priority per day:
       1. If flagged AND day's cap not reached → try to pair with a
@@ -344,18 +359,12 @@ def rule_flagged_pairing(
             )
 
             if paired_today < nivel_overbooking:
-                # Iterate slots before servers: distributes stacking across
-                # the day rather than clustering on the first server's slots.
-                for slot in range(len(appointments[0][dia])):
+                for slot in range(min_stack_slot, len(appointments[0][dia])):
                     for server in range(len(appointments)):
                         current = appointments[server][dia][slot]
                         if (len(current) == 1
                                 and current[0] is not None
                                 and patient_list[current[0]].overbooked_target):
-                            # Existing occupant is flagged — pair with them.
-                            # current[0] = flagged anchor (ids[0] in simulation)
-                            # current.append = flagged stacker (ids[1] in
-                            # simulation, bears WT cost on conflict).
                             current.append(patient.id)
                             patient.num_slot = slot
                             patient.overbooked = True
