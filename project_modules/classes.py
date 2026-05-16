@@ -17,6 +17,7 @@ class Patient:
         self.overbooked = False           # true conflict (double-booked)
         self.overbooked_target = False    # eligibility flag (proba > threshold)
         self.displaced_once = False       # True after first N-slot displacement
+        self.pending_anchor = False  # True if placed alone via descending Step 1, waiting for anchor
 
         if self.regime_subsidized == 1:
             self.protected = True
@@ -27,7 +28,7 @@ class Patient:
             'id', 'proba', 'protected', 'attendance',
             'assigned', 'day_of_call', 'num_slot',
             'overbooked', 'overbooked_target', 'waiting_time',
-            'displaced_once',
+            'displaced_once', 'pending_anchor',
         ])
         prediction = model.predict_proba(patient_data)[:, -1][0]
         self.proba = prediction

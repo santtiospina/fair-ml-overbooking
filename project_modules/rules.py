@@ -54,6 +54,16 @@ def call_a_rule(
                 overbooking_level,
                 min_stack_slot,
             )
+        elif name_rule == 'enhanced_pairing':
+            appointments = rule_enhanced_pairing(
+                patient,
+                patient_list,
+                appointments,
+                threshold_protected,
+                threshold_no_protected,
+                overbooking_level,
+                min_stack_slot
+            )
         else:
             print("Unknown name_rule")
 
@@ -384,5 +394,211 @@ def rule_flagged_pairing(
                     patient.num_slot = slot
                     patient.assigned = True
                     return appointments
+
+    return appointments
+
+def rule_enhanced_pairing(
+    patient,
+    patient_list,
+    appointments,
+    threshold_protected,
+    threshold_no_protected,
+    nivel_overbooking,
+    min_stack_slot=0,
+):
+    """
+    Enhanced pairing overbooking rule with descending stacker scan and
+    deferred anchor pairing.
+
+    Differs from rule_simple_pairing in two ways:
+
+      1. Stacker placement scans slots from the END of the day backward
+         (descending), restricted to slots >= min_stack_slot. This pushes
+         conflicts to late slots, shortening cascade chains and reducing
+         end-of-day overtime pile-up.
+
+      2. A flagged patient can be placed alone at a late empty slot when
+         no eligible non-flagged anchor exists yet. The slot is "reserved"
+         (patient.pending_anchor = True) and counts toward the per-day
+         overbooking cap. A subsequent non-flagged patient that reaches
+         Step 2 (ascending scan) will join the pending slot as its anchor,
+         swapping itself to index 0 and the pending stacker to index 1.
+
+    Mechanism:
+      - A patient is "flagged" if their predicted no-show probability
+        exceeds the group-specific threshold (overbooked_target = True).
+      - The rule places flagged stackers preferentially at late slots,
+        either by attaching to an existing non-flagged anchor or by
+        reserving an empty late slot for a future anchor to join.
+      - Non-flagged patients fill ascending from slot 0, joining any
+        late pending stacker they encounter along the way.
+
+    Per-day cap:
+      `nivel_overbooking` = maximum number of overbooked slots per day.
+      Counts both:
+        - slots with 2 occupants, AND
+        - slots with 1 occupant whose pending_anchor = True
+      Reserving a pending slot counts toward the cap immediately.
+
+    min_stack_slot:
+      The first `min_stack_slot` slots are excluded from Step 1 entirely.
+      Anchor placement (Step 2) is unaffected — anchors still fill from
+      slot 0 as normal. Default 0 enables stacking at any slot.
+
+    Assignment priority per day:
+      Step 1 (flagged only):
+        Scan slots from last to min_stack_slot (descending). At each:
+          a. empty            → place alone, pending_anchor = True
+          b. has non-flagged
+             anchor           → pair as stacker, overbooked = True
+          c. has pending
+             stacker          → skip
+          d. has flagged
+             anchor           → skip (simple_pairing constraint)
+          e. has 2 occupants  → skip
+      Step 2 (all unplaced):
+        Scan slots from slot 0 forward (ascending). At each:
+          a. empty            → place alone
+          b. has pending
+             stacker AND
+             current patient
+             is non-flagged   → join via swap, completing the overbooking
+          c. otherwise        → skip
+    """
+    # Reset state
+    patient.overbooked = False
+    patient.overbooked_target = False
+    patient.pending_anchor = False
+
+    if patient.protected:
+        flagged = patient.proba > threshold_protected
+    else:
+        flagged = patient.proba > threshold_no_protected
+
+    patient.overbooked_target = flagged
+
+    if patient.assigned:
+        return appointments
+
+    start_day = patient.day_of_call
+    end_day = len(appointments[0])
+
+    for dia in range(start_day, end_day):
+
+        # -- Step 1: flagged patient descending scan -------------------------
+        # Scans late slots (>= min_stack_slot) from end of day backward.
+        # Either pairs with a non-flagged anchor (creates overbooked slot
+        # immediately) or reserves an empty late slot (becomes overbooked
+        # when an anchor joins via Step 2).
+        if flagged:
+
+            # Per-day cap counts both 2-occupant slots AND pending reservations.
+            paired_today = sum(
+                1
+                for server in range(len(appointments))
+                for slot_list in appointments[server][dia]
+                if (sum(1 for pid in slot_list if pid is not None) >= 2
+                    or (sum(1 for pid in slot_list if pid is not None) == 1
+                        and any(
+                            patient_list[pid].pending_anchor
+                            for pid in slot_list
+                            if pid is not None
+                        )))
+            )
+
+            if paired_today < nivel_overbooking:
+
+                # Descending scan from last slot to min_stack_slot.
+                for slot in range(
+                    len(appointments[0][dia]) - 1,
+                    min_stack_slot - 1,
+                    -1,
+                ):
+                    for server in range(len(appointments)):
+                        current = appointments[server][dia][slot]
+                        occupants = [pid for pid in current if pid is not None]
+
+                        # Empty slot → reserve as pending stacker.
+                        if len(occupants) == 0:
+                            current[0] = patient.id
+                            patient.num_slot = slot
+                            patient.overbooked = False
+                            patient.pending_anchor = True
+                            patient.assigned = True
+                            return appointments
+
+                        # Single-booked → eligible only if existing occupant
+                        # is a non-flagged anchor (not pending, not flagged).
+                        if len(occupants) == 1:
+                            existing = patient_list[occupants[0]]
+
+                            # Skip pending stackers (another stacker waiting).
+                            if existing.pending_anchor:
+                                continue
+
+                            # Skip flagged anchors (simple_pairing requires
+                            # non-flagged anchor for the stack to be valid).
+                            if existing.overbooked_target:
+                                continue
+
+                            # Eligible: existing is a non-flagged anchor.
+                            current.append(patient.id)
+                            patient.num_slot = slot
+                            patient.overbooked = True
+                            patient.pending_anchor = False
+                            patient.assigned = True
+                            return appointments
+
+                        # Slot already has >= 2 occupants → skip.
+
+        # -- Step 2: ascending fallback --------------------------------------
+        # Reached by:
+        #   - non-flagged patients (always)
+        #   - flagged patients when Step 1 found no eligible slot or cap hit
+        # Non-flagged patients can also complete a pending overbooking by
+        # joining a pending stacker's slot as the anchor (with index swap).
+        # Flagged patients in this branch take only empty slots — joining a
+        # pending stacker would create a flagged-onto-flagged pairing,
+        # violating the rule's non-flagged-anchor invariant.
+        for slot in range(len(appointments[0][dia])):
+            for server in range(len(appointments)):
+                current = appointments[server][dia][slot]
+                occupants = [pid for pid in current if pid is not None]
+
+                # Empty slot → place alone.
+                if len(occupants) == 0:
+                    current[0] = patient.id
+                    patient.num_slot = slot
+                    patient.overbooked = False
+                    patient.pending_anchor = False
+                    patient.assigned = True
+                    return appointments
+
+                # Single-booked pending stacker → join as anchor, but only
+                # if current patient is non-flagged.
+                if len(occupants) == 1 and not flagged:
+                    existing_id = occupants[0]
+                    existing = patient_list[existing_id]
+
+                    if existing.pending_anchor:
+                        # Swap: new patient becomes index 0 (anchor),
+                        # existing stacker moves to index 1.
+                        current[0] = patient.id
+                        current.append(existing_id)
+
+                        # Update existing stacker: now truly overbooked.
+                        existing.overbooked = True
+                        existing.pending_anchor = False
+
+                        # Update new patient as anchor.
+                        patient.num_slot = slot
+                        patient.overbooked = False
+                        patient.pending_anchor = False
+                        patient.assigned = True
+                        return appointments
+
+                # Otherwise → skip (slot has non-pending occupant, or has
+                # >= 2 occupants, or current patient is flagged and can't
+                # join a pending stacker).
 
     return appointments
